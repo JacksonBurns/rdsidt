@@ -110,16 +110,12 @@ class SIDTNode:
     """
     A node in the Subgraph Isomorphic Decision Tree.
     """
-    def __init__(self, smarts="*", depth=0, correction=0.0, absolute_mean=0.0, stdev=np.nan, n_samples=0, mse=0.0):
+    def __init__(self, smarts="*", depth=0, value=0.0, stdev=np.nan, n_samples=0, mse=0.0):
         self.smarts = smarts              # Subgraph Pattern
         self.mol_pattern = Chem.MolFromSmarts(smarts)
         self.depth = depth
-        
-        # Modification: Store correction (delta) and absolute mean
-        self.correction = correction      # Additive contribution of this node
-        self.absolute_mean = absolute_mean # The actual mean of y at this node (used for calculating children deltas)
-        
-        self.stdev = stdev  # standard deviation of target values at this node
+        self.value = value                # Predicted value (mean)
+        self.stdev = stdev  # standard deviation of target values, i.e. uncertainty estimate
         self.n_samples = n_samples
         self.mse = mse
         
@@ -131,7 +127,7 @@ class SIDTNode:
 class RDSIDTRegressor:
     """
     Regressor that builds a decision tree where splits are defined by 
-    chemical substructure extensions. Predictions are additive corrections.
+    chemical substructure extensions.
     """
     def __init__(self, allowed_atoms=None, max_depth=5, min_samples_split=2, min_impurity_decrease=1e-7, verbose=True):
         self.max_depth = max_depth
@@ -158,22 +154,17 @@ class RDSIDTRegressor:
         y = np.array(y)[valid_idxs]
         
         # Initialize Root
-        # For the root, the correction is the global mean (baseline)
-        mean_val = np.mean(y)
         self.root = SIDTNode(
             smarts="*", 
             depth=0, 
-            correction=mean_val,       # Initial baseline
-            absolute_mean=mean_val,    # Stored for children to reference
+            value=np.mean(y), 
             stdev=np.std(y),
             n_samples=len(y),
             mse=self._calculate_mse(y)
         )
         if self.verbose:
             self.pbar.update(1)
-            
         self._split_node(self.root, mols, y)
-        
         if self.verbose:
             self.pbar.close()
             print("Training complete.")
@@ -184,32 +175,17 @@ class RDSIDTRegressor:
         return np.array([self._predict_single(mol, self.root) for mol in mols])
 
     def _predict_single(self, mol, node):
-        """
-        Traverses the tree, summing corrections and updating uncertainty.
-        Returns (predicted_value, uncertainty)
-        """
-        if mol is None: 
-            return (node.absolute_mean, node.stdev)
-
-        # Initialize current prediction state
-        current_prediction = node.correction
-        current_uncertainty = node.stdev
+        if mol is None: return node.value # Fallback
         
-        current_node = node
-
-        # Iterative traversal to accumulate corrections
-        while not current_node.is_leaf:
-            if mol.HasSubstructMatch(current_node.left.mol_pattern):
-                current_node = current_node.left
-            else:
-                current_node = current_node.right
-            
-            # Apply correction
-            current_prediction += current_node.correction
-            # Update uncertainty to the specific cluster's stdev
-            current_uncertainty = current_node.stdev  # TODO: fix this, method in original paper
-            
-        return (current_prediction, current_uncertainty)
+        if node.is_leaf:
+            return (node.value, node.stdev)  # maybe just return the whole node?
+        
+        # In SIDT, the split question is: "Does it match the child's extended subgraph?"
+        # The 'left' child holds the more specific (extended) subgraph.
+        if mol.HasSubstructMatch(node.left.mol_pattern):
+            return self._predict_single(mol, node.left)
+        else:
+            return self._predict_single(mol, node.right)
 
     def _split_node(self, node, mols, y):
         # Stop Criteria
@@ -230,6 +206,8 @@ class RDSIDTRegressor:
             ext_pat = Chem.MolFromSmarts(ext_smarts)
             if ext_pat is None: continue
 
+            # Create Split Mask
+            # Important: RDKit HasSubstructMatch checks if mol contains pattern
             matches = []
             for m in mols:
                 matches.append(m.HasSubstructMatch(ext_pat))
@@ -256,6 +234,7 @@ class RDSIDTRegressor:
             if improvement > best_score:
                 best_score = improvement
                 best_extension = ext_smarts
+                # Store the data splits to avoid recomputing
                 mols_left = [m for i, m in enumerate(mols) if matches[i]]
                 mols_right = [m for i, m in enumerate(mols) if not matches[i]]
                 best_splits = (y_left, y_right, mols_left, mols_right)
@@ -264,39 +243,27 @@ class RDSIDTRegressor:
         if best_score > self.min_impurity_decrease and best_extension is not None:
             y_left, y_right, mols_left, mols_right = best_splits
             
-            # --- LEFT CHILD (Match) ---
-            # Updates prediction to the mean of the matching group
-            mean_left = np.mean(y_left)
-            correction_left = mean_left - node.absolute_mean
-            
+            # Create Left Child (The Extension Match)
             node.left = SIDTNode(
                 smarts=best_extension,
                 depth=node.depth + 1,
-                correction=correction_left, # Applies the shift
-                absolute_mean=mean_left,    # New baseline for children of this node
+                value=np.mean(y_left),
                 stdev=np.std(y_left),
                 n_samples=len(y_left),
-                mse=self._calculate_mse(y_left)
+                mse=self._calculate_mse(y_left),  # could store the above 3, just recalculate instead
             )
             
-            # --- RIGHT CHILD (No Match) ---
-            # "No additional change" -> Correction is 0.0
-            # Baseline remains the parent's baseline
-            correction_right = 0.0
-            # IMPORTANT: absolute_mean stays as node.absolute_mean (Parent's mean), 
-            # NOT np.mean(y_right). This ensures future corrections are relative 
-            # to the established baseline, not the potentially skewed remainder.
-            
+            # Create Right Child (The Remainder)
+            # Inherits parent's SMARTS because it failed the check for the extension
             node.right = SIDTNode(
                 smarts=node.smarts,
                 depth=node.depth + 1,
-                correction=correction_right,    # No change
-                absolute_mean=node.absolute_mean, # Inherit parent baseline
-                stdev=np.std(y_right),          # But track actual uncertainty of this subset
+                value=np.mean(y_right),
+                stdev=np.std(y_right),
                 n_samples=len(y_right),
                 mse=self._calculate_mse(y_right)
             )
-            
+            # if pbar would increase above its total, increase the total
             if self.verbose:
                 if self.pbar.n + 2 > self.pbar.total:
                     self.pbar.total += self.pbar.n
@@ -315,7 +282,7 @@ class RDSIDTRegressor:
     def print_tree(self, node=None, indent=""):
         if node is None: node = self.root
         
-        print(f"{indent}Structure: {node.smarts} | Correction: {node.correction:+.4f} | AbsMean: {node.absolute_mean:.2f} | Stdev: {node.stdev:.2f}")
+        print(f"{indent}Structure: {node.smarts} | Value: {node.value:.2f} | Stdev: {node.stdev:.2f} | N: {node.n_samples}")
         
         if not node.is_leaf:
             print(f"{indent}  [Yes] Contains {node.left.smarts} ?")
@@ -389,9 +356,9 @@ if __name__ == "__main__":
 
     param_grid = {
         "allowed_atoms": [atoms],
-        "max_depth": [15, 30, 45, 90],
+        "max_depth": [4, 8, 16, 32],
         "min_samples_split": [len(train_smiles) // 1000, len(train_smiles) // 500],
-        "min_impurity_decrease": [1e-7, 1e-6],
+        "min_impurity_decrease": [1e-7, 1e-6, 1e-5],
     }
 
     wrapper = SIDTRegressorWrapper()
