@@ -3,14 +3,17 @@ from rdkit import Chem
 from tqdm import tqdm
 from sklearn.metrics import mean_squared_error
 
+from rdkit.Chem import SmilesParserParams
+
+
 class SIDTExtender:
     """
-    Faithful implementation of PySIDT extension generation.
     Uses RDKit RWMol to chemically edit graphs (add atoms, add bonds, ring closures)
     and generates canonical SMARTS to ensure unique features.
     """
-    def __init__(self, allowed_atoms=[6, 7, 8, 9, 16, 17], allowed_bonds=[1, 2, 3]):
-        # C, N, O, F, S, Cl
+    def __init__(self, allowed_atoms=None, allowed_bonds=[1, 2, 3]):
+        if allowed_atoms is None:
+            allowed_atoms = [6, 7, 8, 9, 16, 17]
         self.allowed_atoms = allowed_atoms
         # Single, Double, Triple
         self.allowed_bonds = allowed_bonds
@@ -120,24 +123,29 @@ class SIDTNode:
         self.right = None                 # NO Branch (Does not match Extension)
         self.is_leaf = True
 
-class PySIDTRegressor:
+
+class RDSIDTRegressor:
     """
     Regressor that builds a decision tree where splits are defined by 
     chemical substructure extensions.
     """
-    def __init__(self, max_depth=5, min_samples_split=2, min_impurity_decrease=1e-7):
+    def __init__(self, allowed_atoms=None, max_depth=5, min_samples_split=2, min_impurity_decrease=1e-7, verbose=True):
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
         self.min_impurity_decrease = min_impurity_decrease
-        self.extender = SIDTExtender()
+        self.extender = SIDTExtender(allowed_atoms=allowed_atoms)
+        self.verbose = verbose
         self.root = None
-        
-        # to make a progress bar, assume worst case of full binary tree
-        self.max_nodes = 2**(self.max_depth + 1) - 1
         self.pbar = None
 
+    def __str__(self):
+        return f"RDSIDTRegressor(max_depth={self.max_depth}, min_samples_split={self.min_samples_split}, min_impurity_decrease={self.min_impurity_decrease})"
+
     def fit(self, smiles_list, y):
-        self.pbar = tqdm(total=self.max_nodes, desc="Building SIDT", unit="nodes")
+        if self.verbose:
+            print("Starting SIDT training...")
+            self.pbar = tqdm(total=len(smiles_list) // self.min_samples_split, desc="Building SIDT", unit="nodes")
+        
         mols = [Chem.MolFromSmiles(s) for s in smiles_list]
         
         # Filter out invalid molecules
@@ -154,11 +162,12 @@ class PySIDTRegressor:
             n_samples=len(y),
             mse=self._calculate_mse(y)
         )
-        self.pbar.update(1)
+        if self.verbose:
+            self.pbar.update(1)
         self._split_node(self.root, mols, y)
-        self.pbar.n = self.pbar.total  # ensure completed - often needed because not entire tree gets built
-        self.pbar.close()
-        print("Training complete.")
+        if self.verbose:
+            self.pbar.close()
+            print("Training complete.")
         return self
 
     def predict(self, smiles_list):
@@ -169,7 +178,7 @@ class PySIDTRegressor:
         if mol is None: return node.value # Fallback
         
         if node.is_leaf:
-            return (node.value, node.stdev)  # maybe just return the whole node then we could also know depth and max depth, aka a nice proxy for how good of a match this prediction actually is? idk. maybe make it an option on init
+            return (node.value, node.stdev)  # maybe just return the whole node?
         
         # In SIDT, the split question is: "Does it match the child's extended subgraph?"
         # The 'left' child holds the more specific (extended) subgraph.
@@ -254,7 +263,11 @@ class PySIDTRegressor:
                 n_samples=len(y_right),
                 mse=self._calculate_mse(y_right)
             )
-            self.pbar.update(2)
+            # if pbar would increase above its total, increase the total
+            if self.verbose:
+                if self.pbar.n + 2 > self.pbar.total:
+                    self.pbar.total += self.pbar.n
+                self.pbar.update(2)
             
             node.is_leaf = False
             
@@ -278,7 +291,39 @@ class PySIDTRegressor:
             self.print_tree(node.right, indent + "    ")
 
 
+# small sklearn-compatible wrapper for integration with sklearn hpopt
+class SIDTRegressorWrapper:
+    def __init__(self, allowed_atoms=None, max_depth=5, min_samples_split=2, min_impurity_decrease=1e-7):
+        self.allowed_atoms = allowed_atoms
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_impurity_decrease = min_impurity_decrease
+        self.model = RDSIDTRegressor(allowed_atoms=allowed_atoms, max_depth=max_depth, min_samples_split=min_samples_split, min_impurity_decrease=min_impurity_decrease, verbose=False)
+
+    def get_params(self, deep=True):
+        return {
+            "allowed_atoms": self.allowed_atoms,
+            "max_depth": self.max_depth,
+            "min_samples_split": self.min_samples_split,
+            "min_impurity_decrease": self.min_impurity_decrease
+        }
+    
+    def set_params(self, **params):
+        for key, value in params.items():
+            setattr(self, key, value)
+        self.model = RDSIDTRegressor(allowed_atoms=self.allowed_atoms, max_depth=self.max_depth, min_samples_split=self.min_samples_split, min_impurity_decrease=self.min_impurity_decrease, verbose=False)
+        return self
+
+    def fit(self, X, y):
+        self.model.fit(X, y)
+        return self
+
+    def predict(self, X):
+        return np.array([x[0] for x in self.model.predict(X)])  # return just the mean predictions for sklearn compatibility
+
+
 if __name__ == "__main__":
+    JMOL_TO_KCALMOL = 1 / 4184
     from rdkit.rdBase import BlockLogs
 
     bl = BlockLogs()
@@ -287,18 +332,47 @@ if __name__ == "__main__":
 
     with open("QM9_noncyclic_CHON_Hf298_Jmol_train.json") as f:
         train_data = json.load(f)
+    
+    with open("QM9_noncyclic_CHON_Hf298_Jmol_val.json") as f:
+        val_data = json.load(f)
 
+    train_smiles = [x[0] for x in train_data]
+    train_y = [x[1]*JMOL_TO_KCALMOL for x in train_data]
 
+    val_smiles = [x[0] for x in val_data]
+    val_y = [x[1]*JMOL_TO_KCALMOL for x in val_data]
+    atoms = set()
+    for s in train_smiles:
+        mol = Chem.MolFromSmiles(s)
+        if mol is not None:
+            for atom in mol.GetAtoms():
+                atoms.add(atom.GetAtomicNum())
+    print("Unique atomic numbers in training set:", atoms)
 
-    smiles = [x[0] for x in train_data]
-    y = [x[1] for x in train_data]
+    # hyperparameter tuning
+    from sklearn.model_selection import GridSearchCV, PredefinedSplit
 
-    model = PySIDTRegressor(max_depth=32, min_samples_split=len(smiles) // 1000)  # in reality, would need to set this with the validation set
-    model.fit(smiles, y)
+    ps = PredefinedSplit(test_fold=[-1] * len(train_smiles) + [0] * len(val_smiles))
+
+    param_grid = {
+        "allowed_atoms": [atoms],
+        "max_depth": [4, 8, 16, 32],
+        "min_samples_split": [len(train_smiles) // 1000, len(train_smiles) // 500],
+        "min_impurity_decrease": [1e-7, 1e-6, 1e-5],
+    }
+
+    wrapper = SIDTRegressorWrapper()
+    grid_search = GridSearchCV(wrapper, param_grid, cv=ps, n_jobs=-1, refit=False, scoring="neg_mean_squared_error", verbose=2)
+    grid_search.fit(train_smiles + val_smiles, train_y + val_y)
+
+    print("Refitting model on best parameters:", grid_search.best_params_)
+
+    model = RDSIDTRegressor(**grid_search.best_params_.values().mapping)
+    model.fit(train_smiles + val_smiles, train_y + val_y)
 
     test_data = json.load(open("QM9_noncyclic_CHON_Hf298_Jmol_test.json"))
     smiles = [x[0] for x in test_data]
-    y = [x[1] for x in test_data]
+    y = [x[1]*JMOL_TO_KCALMOL for x in test_data]
     preds = model.predict(smiles)
     y_pred = [p[0] for p in preds]
     y_stdev = [p[1] for p in preds]
@@ -309,6 +383,7 @@ if __name__ == "__main__":
         y,
         y_pred,
         y_err=y_stdev,
+        title=str(model),
         outfile="sidt_parity.png",
         errorbar_kwargs={"alpha": 0.1},
     )   

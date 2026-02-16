@@ -84,7 +84,7 @@ def parity_plot_with_intervals(
 
     ax.set_xlabel("True Value")
     ax.set_ylabel("Predicted Value")
-    ax.set_title(title)
+    ax.set_title(title, fontsize=8)
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlim(min_val, max_val)
     ax.set_ylim(min_val, max_val)
