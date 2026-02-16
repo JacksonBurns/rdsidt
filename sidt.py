@@ -3,8 +3,6 @@ from rdkit import Chem
 from tqdm import tqdm
 from sklearn.metrics import mean_squared_error
 
-from rdkit.Chem import SmilesParserParams
-
 
 class SIDTExtender:
     """
