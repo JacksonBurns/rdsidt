@@ -37,7 +37,7 @@ def parity_plot_with_intervals(
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 6))
 
-    point_kwargs = point_kwargs or dict(s=30, alpha=0.8)
+    point_kwargs = dict(s=30, alpha=0.8) | point_kwargs
     errorbar_kwargs = dict(
         fmt="none", ecolor="gray", alpha=0.6, capsize=2
     )  |errorbar_kwargs

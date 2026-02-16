@@ -385,5 +385,6 @@ if __name__ == "__main__":
         y_err=y_stdev,
         title=str(model),
         outfile="sidt_parity.png",
+        point_kwargs={"alpha": 0.3},
         errorbar_kwargs={"alpha": 0.1},
     )   
